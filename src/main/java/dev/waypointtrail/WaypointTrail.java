@@ -15,13 +15,21 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
@@ -31,7 +39,7 @@ import java.util.function.Consumer;
  * managed with commands, Java chest menus and Bedrock (Floodgate) forms.
  * Only the owner of a waypoint can share, unshare, rename or delete it.
  */
-public class WaypointTrail extends JavaPlugin {
+public class WaypointTrail extends JavaPlugin implements Listener {
 
     private static final double ARRIVE_DISTANCE = 3.0;
 
@@ -46,10 +54,14 @@ public class WaypointTrail extends JavaPlugin {
         }
     }
 
-    // owner -> (lowercase name -> waypoint)
-    private final Map<UUID, Map<String, Waypoint>> waypoints = new HashMap<>();
+    // every waypoint by its permanent ID
+    private final Map<UUID, Waypoint> all = new LinkedHashMap<>();
+    // active boss bars (only while the player is online)
     private final Map<UUID, Track> tracking = new HashMap<>();
+    // player -> tracked waypoint ID, remembered across logout and restarts
+    private final Map<UUID, UUID> savedTracking = new HashMap<>();
     private File dataFile;
+    private File trackingFile;
     private BedrockBridge bedrock;
     private JavaMenus javaMenus;
 
@@ -57,7 +69,10 @@ public class WaypointTrail extends JavaPlugin {
     public void onEnable() {
         getDataFolder().mkdirs();
         dataFile = new File(getDataFolder(), "waypoints.yml");
+        trackingFile = new File(getDataFolder(), "tracking.yml");
         load();
+        loadTracking();
+        getServer().getPluginManager().registerEvents(this, this);
 
         javaMenus = new JavaMenus(this);
         getServer().getPluginManager().registerEvents(javaMenus, this);
@@ -117,17 +132,69 @@ public class WaypointTrail extends JavaPlugin {
 
     // ================= storage =================
 
+    /** Reads a YAML file. If it is damaged, sets it aside (never overwrites it) and tries the .bak copy. */
+    private YamlConfiguration readYaml(File f) {
+        if (!f.exists()) return null;
+        try {
+            YamlConfiguration yml = new YamlConfiguration();
+            yml.load(f);
+            return yml;
+        } catch (Exception e) {
+            getLogger().severe("Could not read " + f.getName() + ": " + e.getMessage());
+            File bad = new File(f.getParentFile(), f.getName() + ".corrupt-" + System.currentTimeMillis());
+            try {
+                Files.move(f.toPath(), bad.toPath());
+                getLogger().severe("The damaged file was kept as " + bad.getName());
+            } catch (IOException ignored) {
+            }
+            File bak = new File(f.getParentFile(), f.getName() + ".bak");
+            if (bak.exists()) {
+                try {
+                    YamlConfiguration yml = new YamlConfiguration();
+                    yml.load(bak);
+                    getLogger().warning("Restored " + f.getName() + " from its backup.");
+                    return yml;
+                } catch (Exception ignored) {
+                }
+            }
+            return null;
+        }
+    }
+
+    /** Writes to a temp file first, then swaps it in, so a crash mid-save can't corrupt the real file. */
+    private void safeSave(File target, YamlConfiguration yml, boolean keepBackup) {
+        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
+        try {
+            yml.save(tmp);
+            if (keepBackup && target.exists()) {
+                Files.copy(target.toPath(), new File(target.getParentFile(), target.getName() + ".bak").toPath(),
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+            try {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            getLogger().warning("Could not save " + target.getName() + ": " + e.getMessage());
+        }
+    }
+
     private void load() {
-        waypoints.clear();
-        if (!dataFile.exists()) return;
-        YamlConfiguration yml = YamlConfiguration.loadConfiguration(dataFile);
+        all.clear();
+        YamlConfiguration yml = readYaml(dataFile);
+        if (yml == null) return;
         ConfigurationSection root = yml.getConfigurationSection("waypoints");
         if (root == null) return;
+        boolean migrated = false;
         for (String key : root.getKeys(false)) {
             ConfigurationSection s = root.getConfigurationSection(key);
             if (s == null) continue;
             try {
                 Waypoint w = new Waypoint();
+                String id = s.getString("id");
+                if (id != null) w.id = UUID.fromString(id);
+                else migrated = true; // older file without IDs: a new one is generated
                 w.owner = UUID.fromString(s.getString("owner", ""));
                 w.ownerName = s.getString("ownerName", "?");
                 w.name = s.getString("name", "");
@@ -136,62 +203,117 @@ public class WaypointTrail extends JavaPlugin {
                 w.y = s.getDouble("y");
                 w.z = s.getDouble("z");
                 w.shared = s.getBoolean("shared");
-                waypoints.computeIfAbsent(w.owner, k -> new LinkedHashMap<>()).put(w.name.toLowerCase(), w);
+                all.put(w.id, w);
             } catch (IllegalArgumentException ignored) {
             }
         }
+        if (migrated) save();
     }
 
     private void save() {
         YamlConfiguration yml = new YamlConfiguration();
         int i = 0;
-        for (Map<String, Waypoint> map : waypoints.values()) {
-            for (Waypoint w : map.values()) {
-                String p = "waypoints." + (i++) + ".";
-                yml.set(p + "owner", w.owner.toString());
-                yml.set(p + "ownerName", w.ownerName);
-                yml.set(p + "name", w.name);
-                yml.set(p + "world", w.world);
-                yml.set(p + "x", w.x);
-                yml.set(p + "y", w.y);
-                yml.set(p + "z", w.z);
-                yml.set(p + "shared", w.shared);
+        for (Waypoint w : all.values()) {
+            String p = "waypoints." + (i++) + ".";
+            yml.set(p + "id", w.id.toString());
+            yml.set(p + "owner", w.owner.toString());
+            yml.set(p + "ownerName", w.ownerName);
+            yml.set(p + "name", w.name);
+            yml.set(p + "world", w.world);
+            yml.set(p + "x", w.x);
+            yml.set(p + "y", w.y);
+            yml.set(p + "z", w.z);
+            yml.set(p + "shared", w.shared);
+        }
+        safeSave(dataFile, yml, true);
+    }
+
+    private void loadTracking() {
+        savedTracking.clear();
+        YamlConfiguration yml = readYaml(trackingFile);
+        if (yml == null) return;
+        ConfigurationSection root = yml.getConfigurationSection("tracking");
+        if (root == null) return;
+        for (String key : root.getKeys(false)) {
+            try {
+                savedTracking.put(UUID.fromString(key), UUID.fromString(root.getString(key, "")));
+            } catch (IllegalArgumentException ignored) {
             }
         }
-        try {
-            yml.save(dataFile);
-        } catch (IOException e) {
-            getLogger().warning("Could not save waypoints: " + e.getMessage());
+    }
+
+    private void saveTracking() {
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Map.Entry<UUID, UUID> e : savedTracking.entrySet()) {
+            yml.set("tracking." + e.getKey(), e.getValue().toString());
         }
+        safeSave(trackingFile, yml, false);
+    }
+
+    private void forgetTracking(UUID player) {
+        if (savedTracking.remove(player) != null) saveTracking();
+    }
+
+    // ================= join / quit =================
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        Player p = e.getPlayer();
+
+        // keep the shown owner name current if the player changed their Minecraft name
+        boolean changed = false;
+        for (Waypoint w : all.values()) {
+            if (w.owner.equals(p.getUniqueId()) && !w.ownerName.equals(p.getName())) {
+                w.ownerName = p.getName();
+                changed = true;
+            }
+        }
+        if (changed) save();
+
+        // pick tracking back up where they left off
+        UUID wid = savedTracking.get(p.getUniqueId());
+        if (wid != null) {
+            Waypoint w = all.get(wid);
+            if (w != null && (w.shared || w.owner.equals(p.getUniqueId()))) begin(p, w, true);
+            else forgetTracking(p.getUniqueId());
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        // the boss bar disappears with the player; the saved tracking target stays for next login
+        tracking.remove(e.getPlayer().getUniqueId());
     }
 
     // ================= lookup =================
 
     boolean exists(Waypoint w) {
-        return waypoints.getOrDefault(w.owner, Map.of()).get(w.name.toLowerCase()) == w;
+        return all.get(w.id) == w;
+    }
+
+    private Waypoint findByOwnerAndName(UUID owner, String name) {
+        for (Waypoint w : all.values()) {
+            if (w.owner.equals(owner) && w.name.equalsIgnoreCase(name)) return w;
+        }
+        return null;
     }
 
     Waypoint findOwn(Player p, String name) {
-        Map<String, Waypoint> map = waypoints.get(p.getUniqueId());
-        return map == null ? null : map.get(name.toLowerCase());
+        return findByOwnerAndName(p.getUniqueId(), name);
     }
 
     /** Own waypoint first, then a shared one with that name. Also accepts "owner:name". */
     Waypoint findVisible(Player p, String name) {
         if (name.contains(":")) {
             String[] parts = name.split(":", 2);
-            for (Map<String, Waypoint> map : waypoints.values()) {
-                for (Waypoint w : map.values()) {
-                    if (w.shared && w.ownerName.equalsIgnoreCase(parts[0]) && w.name.equalsIgnoreCase(parts[1])) return w;
-                }
+            for (Waypoint w : all.values()) {
+                if (w.shared && w.ownerName.equalsIgnoreCase(parts[0]) && w.name.equalsIgnoreCase(parts[1])) return w;
             }
         }
         Waypoint own = findOwn(p, name);
         if (own != null) return own;
-        for (Map<String, Waypoint> map : waypoints.values()) {
-            for (Waypoint w : map.values()) {
-                if (w.shared && w.name.equalsIgnoreCase(name)) return w;
-            }
+        for (Waypoint w : all.values()) {
+            if (w.shared && w.name.equalsIgnoreCase(name)) return w;
         }
         return null;
     }
@@ -200,11 +322,9 @@ public class WaypointTrail extends JavaPlugin {
     List<Waypoint> visibleTo(Player p) {
         List<Waypoint> mine = new ArrayList<>();
         List<Waypoint> others = new ArrayList<>();
-        for (Map<String, Waypoint> map : waypoints.values()) {
-            for (Waypoint w : map.values()) {
-                if (w.owner.equals(p.getUniqueId())) mine.add(w);
-                else if (w.shared) others.add(w);
-            }
+        for (Waypoint w : all.values()) {
+            if (w.owner.equals(p.getUniqueId())) mine.add(w);
+            else if (w.shared) others.add(w);
         }
         Comparator<Waypoint> byName = Comparator.comparing(w -> w.name.toLowerCase());
         mine.sort(byName);
@@ -231,8 +351,7 @@ public class WaypointTrail extends JavaPlugin {
         String name = raw == null ? "" : raw.trim();
         String err = validateName(name);
         if (err != null) return err;
-        Map<String, Waypoint> mine = waypoints.computeIfAbsent(p.getUniqueId(), k -> new LinkedHashMap<>());
-        if (mine.containsKey(name.toLowerCase())) return "You already have a waypoint called '" + name + "'.";
+        if (findOwn(p, name) != null) return "You already have a waypoint called '" + name + "'.";
         Location l = p.getLocation();
         Waypoint w = new Waypoint();
         w.owner = p.getUniqueId();
@@ -243,7 +362,7 @@ public class WaypointTrail extends JavaPlugin {
         w.y = l.getBlockY();
         w.z = l.getBlockZ() + 0.5;
         w.shared = shared;
-        mine.put(name.toLowerCase(), w);
+        all.put(w.id, w);
         save();
         return null;
     }
@@ -260,21 +379,17 @@ public class WaypointTrail extends JavaPlugin {
         String name = raw == null ? "" : raw.trim();
         String err = validateName(name);
         if (err != null) return err;
-        Map<String, Waypoint> mine = waypoints.get(w.owner);
-        if (mine == null || mine.get(w.name.toLowerCase()) != w) return "That waypoint no longer exists.";
-        Waypoint clash = mine.get(name.toLowerCase());
+        if (!exists(w)) return "That waypoint no longer exists.";
+        Waypoint clash = findByOwnerAndName(w.owner, name);
         if (clash != null && clash != w) return "You already have a waypoint called '" + name + "'.";
-        mine.remove(w.name.toLowerCase());
         w.name = name;
-        mine.put(name.toLowerCase(), w);
         save();
         return null;
     }
 
     String remove(Player p, Waypoint w) {
         if (!w.owner.equals(p.getUniqueId())) return notOwner(w);
-        Map<String, Waypoint> mine = waypoints.get(w.owner);
-        if (mine == null || mine.remove(w.name.toLowerCase()) == null) return "That waypoint no longer exists.";
+        if (all.remove(w.id) == null) return "That waypoint no longer exists.";
         save();
         return null;
     }
@@ -293,16 +408,27 @@ public class WaypointTrail extends JavaPlugin {
     }
 
     void startTracking(Player p, Waypoint w) {
-        stopTracking(p, false);
+        begin(p, w, false);
+    }
+
+    private void begin(Player p, Waypoint w, boolean resumed) {
+        Track old = tracking.remove(p.getUniqueId());
+        if (old != null) p.hideBossBar(old.bar);
         BossBar bar = BossBar.bossBar(legacy("§b" + w.name), 0f, BossBar.Color.GREEN, BossBar.Overlay.PROGRESS);
         Track t = new Track(w, bar);
         tracking.put(p.getUniqueId(), t);
         p.showBossBar(bar);
-        tell(p, "§aTracking '" + w.name + "' §7- §f" + posText(w) + " §7(" + dimName(w.world) + "). Use /wp stop to cancel.");
+        if (!w.id.equals(savedTracking.get(p.getUniqueId()))) {
+            savedTracking.put(p.getUniqueId(), w.id);
+            saveTracking();
+        }
+        tell(p, (resumed ? "§aResumed tracking '" : "§aTracking '") + w.name + "' §7- §f" + posText(w)
+                + " §7(" + dimName(w.world) + "). Use /wp stop to cancel.");
         updateTrack(p, t);
     }
 
     void stopTracking(Player p, boolean message) {
+        forgetTracking(p.getUniqueId());
         Track t = tracking.remove(p.getUniqueId());
         if (t == null) {
             if (message) tell(p, "§7You're not tracking anything.");
@@ -328,11 +454,13 @@ public class WaypointTrail extends JavaPlugin {
                 p.hideBossBar(t.bar);
                 p.sendActionBar(Component.empty());
                 tell(p, "§eThat waypoint is no longer available. Tracking stopped.");
+                forgetTracking(p.getUniqueId());
                 it.remove();
                 continue;
             }
             if (!updateTrack(p, t)) {
                 p.hideBossBar(t.bar);
+                forgetTracking(p.getUniqueId());
                 it.remove();
             }
         }
@@ -463,7 +591,50 @@ public class WaypointTrail extends JavaPlugin {
                 .then(Commands.literal("remove")
                         .then(Commands.argument("name", StringArgumentType.greedyString())
                                 .suggests((ctx, b) -> suggest(b, ownNames(ctx), false))
-                                .executes(ctx -> run(ctx, p -> cmdRemove(p, StringArgumentType.getString(ctx, "name"))))));
+                                .executes(ctx -> run(ctx, p -> cmdRemove(p, StringArgumentType.getString(ctx, "name"))))))
+                // console-only cleanup: players (admins included) can't use this
+                .then(Commands.literal("admin")
+                        .requires(src -> !(src.getSender() instanceof Player))
+                        .then(Commands.literal("list").executes(ctx -> {
+                            adminList(ctx.getSource().getSender());
+                            return Command.SINGLE_SUCCESS;
+                        }))
+                        .then(Commands.literal("remove")
+                                .then(Commands.argument("target", StringArgumentType.greedyString())
+                                        .executes(ctx -> {
+                                            adminRemove(ctx.getSource().getSender(), StringArgumentType.getString(ctx, "target"));
+                                            return Command.SINGLE_SUCCESS;
+                                        }))));
+    }
+
+    private void adminList(CommandSender s) {
+        if (all.isEmpty()) {
+            s.sendMessage("No waypoints saved.");
+            return;
+        }
+        for (Waypoint w : all.values()) {
+            s.sendMessage("[" + w.id.toString().substring(0, 8) + "] " + w.name + " - " + w.ownerName
+                    + " (" + (w.shared ? "shared" : "private") + ") " + posText(w) + " in " + w.world);
+        }
+        s.sendMessage("Remove one with: wp admin remove <id> or wp admin remove <owner>:<name>");
+    }
+
+    private void adminRemove(CommandSender s, String target) {
+        String t = target.trim();
+        List<Waypoint> matches = new ArrayList<>();
+        for (Waypoint w : all.values()) {
+            boolean idMatch = t.length() >= 4 && w.id.toString().toLowerCase().startsWith(t.toLowerCase());
+            boolean nameMatch = t.contains(":") && (w.ownerName + ":" + w.name).equalsIgnoreCase(t);
+            if (idMatch || nameMatch) matches.add(w);
+        }
+        if (matches.size() != 1) {
+            s.sendMessage(matches.isEmpty() ? "No waypoint matches '" + t + "'." : "More than one waypoint matches, use a longer id.");
+            return;
+        }
+        Waypoint w = matches.get(0);
+        all.remove(w.id);
+        save();
+        s.sendMessage("Removed '" + w.name + "' owned by " + w.ownerName + ".");
     }
 
     private void cmdAdd(Player p, String name, boolean shared) {
