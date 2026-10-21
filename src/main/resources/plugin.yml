@@ -1,0 +1,10 @@
+name: WaypointTrail
+version: 1.0.0
+main: dev.waypointtrail.WaypointTrail
+api-version: '26.1'
+description: Create waypoints and follow a particle trail to them. Works for Java and Geyser Bedrock players.
+commands:
+  wp:
+    description: Waypoint commands
+    usage: /wp <add|list|remove|track|stop|share|unshare>
+    aliases: [waypoint, waypoints]
