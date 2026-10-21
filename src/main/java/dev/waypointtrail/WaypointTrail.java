@@ -1,64 +1,121 @@
 package dev.waypointtrail;
 
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.suggestion.Suggestions;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.command.brigadier.Commands;
+import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
+import net.kyori.adventure.bossbar.BossBar;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
-import org.bukkit.Particle;
 import org.bukkit.World;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandSender;
-import org.bukkit.command.TabExecutor;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.util.Vector;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 /**
- * WaypointTrail: private or shared waypoints, with a particle trail to follow.
- * Only uses commands + particles + action bar, so it works the same for Java and Geyser/Bedrock players.
+ * WaypointTrail: private or shared waypoints, tracked with a boss bar,
+ * managed with commands, Java chest menus and Bedrock (Floodgate) forms.
+ * Only the owner of a waypoint can share, unshare, rename or delete it.
  */
-public class WaypointTrail extends JavaPlugin implements TabExecutor {
+public class WaypointTrail extends JavaPlugin {
 
-    private static final int MAX_PER_PLAYER = 50;
-    private static final double TRAIL_LENGTH = 14;   // blocks of trail shown ahead of the player
-    private static final double TRAIL_SPACING = 1.0; // blocks between particles
     private static final double ARRIVE_DISTANCE = 3.0;
 
-    private static class Waypoint {
-        UUID owner;
-        String ownerName;
-        String name;
-        String world;
-        double x, y, z;
-        boolean shared;
+    private static class Track {
+        final Waypoint wp;
+        final BossBar bar;
+        double maxDist = 1;
+
+        Track(Waypoint wp, BossBar bar) {
+            this.wp = wp;
+            this.bar = bar;
+        }
     }
 
     // owner -> (lowercase name -> waypoint)
     private final Map<UUID, Map<String, Waypoint>> waypoints = new HashMap<>();
-    // player -> currently tracked waypoint
-    private final Map<UUID, Waypoint> tracking = new HashMap<>();
+    private final Map<UUID, Track> tracking = new HashMap<>();
     private File dataFile;
+    private BedrockBridge bedrock;
+    private JavaMenus javaMenus;
 
     @Override
     public void onEnable() {
-        dataFile = new File(getDataFolder(), "waypoints.yml");
         getDataFolder().mkdirs();
+        dataFile = new File(getDataFolder(), "waypoints.yml");
         load();
-        Objects.requireNonNull(getCommand("wp")).setExecutor(this);
-        Objects.requireNonNull(getCommand("wp")).setTabCompleter(this);
-        Bukkit.getScheduler().runTaskTimer(this, this::tickTrails, 10L, 5L);
+
+        javaMenus = new JavaMenus(this);
+        getServer().getPluginManager().registerEvents(javaMenus, this);
+
+        if (getServer().getPluginManager().getPlugin("floodgate") != null) {
+            try {
+                bedrock = new FloodgateBridge(this);
+                getLogger().info("Floodgate found: Bedrock players get form menus.");
+            } catch (Throwable t) {
+                getLogger().warning("Floodgate found, but its API could not be used: " + t);
+            }
+        } else {
+            getLogger().info("Floodgate not found: everyone gets the chest menu.");
+        }
+
+        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event ->
+                event.registrar().register(buildCommand().build(), "Create waypoints and track them",
+                        List.of("waypoint", "waypoints")));
+
+        Bukkit.getScheduler().runTaskTimer(this, this::tickTracking, 10L, 5L);
     }
 
     @Override
     public void onDisable() {
+        for (Map.Entry<UUID, Track> e : tracking.entrySet()) {
+            Player p = Bukkit.getPlayer(e.getKey());
+            if (p != null) p.hideBossBar(e.getValue().bar);
+        }
+        tracking.clear();
         save();
     }
 
-    // ---------- storage ----------
+    // ================= text helpers =================
+
+    static Component legacy(String s) {
+        return LegacyComponentSerializer.legacySection().deserialize(s);
+    }
+
+    void tell(Player p, String s) {
+        p.sendMessage(legacy(s));
+    }
+
+    String posText(Waypoint w) {
+        return "X: " + (int) Math.floor(w.x) + "  Y: " + (int) Math.floor(w.y) + "  Z: " + (int) Math.floor(w.z);
+    }
+
+    String dimName(String worldName) {
+        World w = Bukkit.getWorld(worldName);
+        if (w == null) return worldName;
+        return switch (w.getEnvironment()) {
+            case NETHER -> "Nether";
+            case THE_END -> "The End";
+            case NORMAL -> w.equals(Bukkit.getWorlds().get(0)) ? "Overworld" : worldName;
+            default -> worldName;
+        };
+    }
+
+    // ================= storage =================
 
     private void load() {
         waypoints.clear();
@@ -108,15 +165,19 @@ public class WaypointTrail extends JavaPlugin implements TabExecutor {
         }
     }
 
-    // ---------- lookup ----------
+    // ================= lookup =================
 
-    private Waypoint findOwn(Player p, String name) {
+    boolean exists(Waypoint w) {
+        return waypoints.getOrDefault(w.owner, Map.of()).get(w.name.toLowerCase()) == w;
+    }
+
+    Waypoint findOwn(Player p, String name) {
         Map<String, Waypoint> map = waypoints.get(p.getUniqueId());
         return map == null ? null : map.get(name.toLowerCase());
     }
 
-    /** Own waypoint first, then any shared waypoint with that name. Also accepts "owner:name". */
-    private Waypoint findVisible(Player p, String name) {
+    /** Own waypoint first, then a shared one with that name. Also accepts "owner:name". */
+    Waypoint findVisible(Player p, String name) {
         if (name.contains(":")) {
             String[] parts = name.split(":", 2);
             for (Map<String, Waypoint> map : waypoints.values()) {
@@ -124,7 +185,6 @@ public class WaypointTrail extends JavaPlugin implements TabExecutor {
                     if (w.shared && w.ownerName.equalsIgnoreCase(parts[0]) && w.name.equalsIgnoreCase(parts[1])) return w;
                 }
             }
-            return null;
         }
         Waypoint own = findOwn(p, name);
         if (own != null) return own;
@@ -136,223 +196,344 @@ public class WaypointTrail extends JavaPlugin implements TabExecutor {
         return null;
     }
 
-    private List<Waypoint> visibleTo(Player p) {
-        List<Waypoint> list = new ArrayList<>();
+    /** The player's own waypoints first, then everyone else's shared ones. */
+    List<Waypoint> visibleTo(Player p) {
+        List<Waypoint> mine = new ArrayList<>();
+        List<Waypoint> others = new ArrayList<>();
         for (Map<String, Waypoint> map : waypoints.values()) {
             for (Waypoint w : map.values()) {
-                if (w.owner.equals(p.getUniqueId()) || w.shared) list.add(w);
+                if (w.owner.equals(p.getUniqueId())) mine.add(w);
+                else if (w.shared) others.add(w);
             }
         }
-        return list;
+        Comparator<Waypoint> byName = Comparator.comparing(w -> w.name.toLowerCase());
+        mine.sort(byName);
+        others.sort(byName);
+        mine.addAll(others);
+        return mine;
     }
 
-    // ---------- trail ----------
+    // ================= actions (shared by commands and menus) =================
 
-    private void tickTrails() {
-        Iterator<Map.Entry<UUID, Waypoint>> it = tracking.entrySet().iterator();
+    private String validateName(String name) {
+        if (name.isEmpty()) return "The name can't be empty.";
+        if (name.length() > 32) return "The name must be 32 characters or less.";
+        if (name.contains(":") || name.contains("§")) return "The name can't contain ':' or '§'.";
+        return null;
+    }
+
+    private String notOwner(Waypoint w) {
+        return "§cOnly the owner (" + w.ownerName + ") can change that waypoint.";
+    }
+
+    /** Returns an error message, or null on success. */
+    String createWaypoint(Player p, String raw, boolean shared) {
+        String name = raw == null ? "" : raw.trim();
+        String err = validateName(name);
+        if (err != null) return err;
+        Map<String, Waypoint> mine = waypoints.computeIfAbsent(p.getUniqueId(), k -> new LinkedHashMap<>());
+        if (mine.containsKey(name.toLowerCase())) return "You already have a waypoint called '" + name + "'.";
+        Location l = p.getLocation();
+        Waypoint w = new Waypoint();
+        w.owner = p.getUniqueId();
+        w.ownerName = p.getName();
+        w.name = name;
+        w.world = l.getWorld().getName();
+        w.x = l.getBlockX() + 0.5;
+        w.y = l.getBlockY();
+        w.z = l.getBlockZ() + 0.5;
+        w.shared = shared;
+        mine.put(name.toLowerCase(), w);
+        save();
+        return null;
+    }
+
+    String setShared(Player p, Waypoint w, boolean shared) {
+        if (!w.owner.equals(p.getUniqueId())) return notOwner(w);
+        w.shared = shared;
+        save();
+        return null;
+    }
+
+    String rename(Player p, Waypoint w, String raw) {
+        if (!w.owner.equals(p.getUniqueId())) return notOwner(w);
+        String name = raw == null ? "" : raw.trim();
+        String err = validateName(name);
+        if (err != null) return err;
+        Map<String, Waypoint> mine = waypoints.get(w.owner);
+        if (mine == null || mine.get(w.name.toLowerCase()) != w) return "That waypoint no longer exists.";
+        Waypoint clash = mine.get(name.toLowerCase());
+        if (clash != null && clash != w) return "You already have a waypoint called '" + name + "'.";
+        mine.remove(w.name.toLowerCase());
+        w.name = name;
+        mine.put(name.toLowerCase(), w);
+        save();
+        return null;
+    }
+
+    String remove(Player p, Waypoint w) {
+        if (!w.owner.equals(p.getUniqueId())) return notOwner(w);
+        Map<String, Waypoint> mine = waypoints.get(w.owner);
+        if (mine == null || mine.remove(w.name.toLowerCase()) == null) return "That waypoint no longer exists.";
+        save();
+        return null;
+    }
+
+    // ================= menus =================
+
+    void openMenu(Player p) {
+        if (bedrock != null && bedrock.isBedrock(p.getUniqueId())) bedrock.openMain(p);
+        else javaMenus.openMain(p, 0);
+    }
+
+    // ================= tracking (boss bar) =================
+
+    boolean isTracking(Player p) {
+        return tracking.containsKey(p.getUniqueId());
+    }
+
+    void startTracking(Player p, Waypoint w) {
+        stopTracking(p, false);
+        BossBar bar = BossBar.bossBar(legacy("§b" + w.name), 0f, BossBar.Color.GREEN, BossBar.Overlay.PROGRESS);
+        Track t = new Track(w, bar);
+        tracking.put(p.getUniqueId(), t);
+        p.showBossBar(bar);
+        tell(p, "§aTracking '" + w.name + "' §7- §f" + posText(w) + " §7(" + dimName(w.world) + "). Use /wp stop to cancel.");
+        updateTrack(p, t);
+    }
+
+    void stopTracking(Player p, boolean message) {
+        Track t = tracking.remove(p.getUniqueId());
+        if (t == null) {
+            if (message) tell(p, "§7You're not tracking anything.");
+            return;
+        }
+        p.hideBossBar(t.bar);
+        p.sendActionBar(Component.empty());
+        if (message) tell(p, "§eTracking stopped.");
+    }
+
+    private void tickTracking() {
+        Iterator<Map.Entry<UUID, Track>> it = tracking.entrySet().iterator();
         while (it.hasNext()) {
-            Map.Entry<UUID, Waypoint> e = it.next();
+            Map.Entry<UUID, Track> e = it.next();
             Player p = Bukkit.getPlayer(e.getKey());
-            Waypoint w = e.getValue();
+            Track t = e.getValue();
             if (p == null || !p.isOnline()) {
                 it.remove();
                 continue;
             }
-            // waypoint was deleted or made private by someone else
-            boolean stillValid = waypoints.getOrDefault(w.owner, Map.of()).get(w.name.toLowerCase()) == w
-                    && (w.shared || w.owner.equals(p.getUniqueId()));
-            if (!stillValid) {
-                p.sendMessage("§eThat waypoint is no longer available. Tracking stopped.");
+            // deleted, or made private by its owner
+            if (!exists(t.wp) || !(t.wp.shared || t.wp.owner.equals(p.getUniqueId()))) {
+                p.hideBossBar(t.bar);
+                p.sendActionBar(Component.empty());
+                tell(p, "§eThat waypoint is no longer available. Tracking stopped.");
                 it.remove();
                 continue;
             }
-            if (!p.getWorld().getName().equals(w.world)) {
-                p.sendActionBar(net.kyori.adventure.text.Component.text("§7Waypoint '" + w.name + "' is in another world (" + w.world + ")"));
-                continue;
-            }
-            Location from = p.getLocation().add(0, 0.8, 0);
-            Vector to = new Vector(w.x, w.y, w.z).subtract(from.toVector());
-            double dist = to.length();
-            if (dist <= ARRIVE_DISTANCE) {
-                p.sendMessage("§aYou arrived at '" + w.name + "'.");
-                p.sendActionBar(net.kyori.adventure.text.Component.text("§aArrived!"));
+            if (!updateTrack(p, t)) {
+                p.hideBossBar(t.bar);
                 it.remove();
-                continue;
-            }
-            p.sendActionBar(net.kyori.adventure.text.Component.text(
-                    "§b" + w.name + " §7- §f" + (int) dist + " blocks"));
-
-            Vector dir = to.clone().normalize();
-            double max = Math.min(TRAIL_LENGTH, dist - 1);
-            World world = p.getWorld();
-            for (double d = 2; d <= max; d += TRAIL_SPACING) {
-                Vector pos = from.toVector().add(dir.clone().multiply(d));
-                p.spawnParticle(Particle.END_ROD, pos.getX(), pos.getY(), pos.getZ(), 1, 0, 0, 0, 0);
-            }
-            // beacon-like marker at the destination when it's within view range
-            if (dist < 64) {
-                for (double dy = 0; dy < 6; dy += 1.0) {
-                    p.spawnParticle(Particle.END_ROD, w.x, w.y + dy, w.z, 1, 0.1, 0, 0.1, 0);
-                }
             }
         }
     }
 
-    // ---------- commands ----------
+    /** Returns false when the player arrived and tracking should end. */
+    private boolean updateTrack(Player p, Track t) {
+        Waypoint w = t.wp;
+        String pos = posText(w);
+        String dim = dimName(w.world);
 
-    @Override
-    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
-        if (!(sender instanceof Player p)) {
-            sender.sendMessage("Players only.");
+        if (!p.getWorld().getName().equals(w.world)) {
+            t.bar.name(legacy("§b" + w.name + " §7| §cin another world: §f" + dim));
+            t.bar.progress(0f);
+            t.bar.color(BossBar.Color.RED);
+            p.sendActionBar(legacy("§7Position: §f" + pos + " §7(" + dim + ")"));
             return true;
         }
-        if (args.length == 0) {
-            help(p);
-            return true;
+
+        Location loc = p.getLocation();
+        double dx = w.x - loc.getX();
+        double dy = w.y - loc.getY();
+        double dz = w.z - loc.getZ();
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+
+        if (horiz <= ARRIVE_DISTANCE && Math.abs(dy) <= 6) {
+            tell(p, "§aYou arrived at '" + w.name + "'.");
+            p.sendActionBar(legacy("§aArrived at " + w.name + "!"));
+            return false;
         }
-        String sub = args[0].toLowerCase();
-        switch (sub) {
-            case "add", "create", "set" -> {
-                if (args.length < 2) {
-                    p.sendMessage("§cUsage: /wp add <name> [shared]");
-                    return true;
-                }
-                String name = args[1];
-                if (name.contains(":") || name.length() > 24) {
-                    p.sendMessage("§cName can't contain ':' and must be 24 characters or less.");
-                    return true;
-                }
-                Map<String, Waypoint> mine = waypoints.computeIfAbsent(p.getUniqueId(), k -> new LinkedHashMap<>());
-                if (mine.containsKey(name.toLowerCase())) {
-                    p.sendMessage("§cYou already have a waypoint called '" + name + "'. Remove it first.");
-                    return true;
-                }
-                if (mine.size() >= MAX_PER_PLAYER) {
-                    p.sendMessage("§cYou reached the limit of " + MAX_PER_PLAYER + " waypoints.");
-                    return true;
-                }
-                Location l = p.getLocation();
-                Waypoint w = new Waypoint();
-                w.owner = p.getUniqueId();
-                w.ownerName = p.getName();
-                w.name = name;
-                w.world = l.getWorld().getName();
-                w.x = l.getBlockX() + 0.5;
-                w.y = l.getBlockY();
-                w.z = l.getBlockZ() + 0.5;
-                w.shared = args.length >= 3 && args[2].equalsIgnoreCase("shared");
-                mine.put(name.toLowerCase(), w);
-                save();
-                p.sendMessage("§aWaypoint '" + name + "' created" + (w.shared ? " §7(shared)" : " §7(private)") + "§a.");
-            }
-            case "list" -> {
-                List<Waypoint> list = visibleTo(p);
-                if (list.isEmpty()) {
-                    p.sendMessage("§7No waypoints yet. Use /wp add <name>");
-                    return true;
-                }
-                p.sendMessage("§6--- Waypoints ---");
-                for (Waypoint w : list) {
-                    boolean mine = w.owner.equals(p.getUniqueId());
-                    String who = mine ? "you" : w.ownerName;
-                    p.sendMessage("§e" + w.name + " §7[" + (w.shared ? "shared" : "private") + ", by " + who + "] §f"
-                            + (int) w.x + " " + (int) w.y + " " + (int) w.z + " §7(" + w.world + ")");
-                }
-            }
-            case "remove", "delete" -> {
-                if (args.length < 2) {
-                    p.sendMessage("§cUsage: /wp remove <name>");
-                    return true;
-                }
-                Map<String, Waypoint> mine = waypoints.get(p.getUniqueId());
-                Waypoint w = mine == null ? null : mine.remove(args[1].toLowerCase());
-                if (w == null) {
-                    p.sendMessage("§cYou don't have a waypoint called '" + args[1] + "'. (You can only remove your own.)");
-                    return true;
-                }
-                save();
-                p.sendMessage("§aRemoved '" + w.name + "'.");
-            }
-            case "track", "go", "navigate" -> {
-                if (args.length < 2) {
-                    p.sendMessage("§cUsage: /wp track <name>");
-                    return true;
-                }
-                Waypoint w = findVisible(p, args[1]);
-                if (w == null) {
-                    p.sendMessage("§cNo waypoint called '" + args[1] + "'. Try /wp list");
-                    return true;
-                }
-                tracking.put(p.getUniqueId(), w);
-                p.sendMessage("§aFollow the particles to '" + w.name + "'. Use /wp stop to cancel.");
-            }
-            case "stop", "untrack" -> {
-                if (tracking.remove(p.getUniqueId()) != null) p.sendMessage("§eTracking stopped.");
-                else p.sendMessage("§7You're not tracking anything.");
-            }
-            case "share", "unshare" -> {
-                if (args.length < 2) {
-                    p.sendMessage("§cUsage: /wp " + sub + " <name>");
-                    return true;
-                }
-                Waypoint w = findOwn(p, args[1]);
-                if (w == null) {
-                    p.sendMessage("§cYou don't have a waypoint called '" + args[1] + "'.");
-                    return true;
-                }
-                w.shared = sub.equals("share");
-                save();
-                p.sendMessage("§a'" + w.name + "' is now " + (w.shared ? "shared with everyone." : "private."));
-            }
-            default -> help(p);
-        }
+
+        t.maxDist = Math.max(t.maxDist, horiz);
+        float progress = (float) Math.max(0, Math.min(1, 1 - horiz / t.maxDist));
+        t.bar.progress(progress);
+        t.bar.color(BossBar.Color.GREEN);
+
+        StringBuilder title = new StringBuilder("§b" + w.name + " §7| §f" + (int) horiz + " blocks §7| §e" + direction(p, dx, dz));
+        if (dy > 3) title.append(" §7| §d").append((int) dy).append(" up");
+        else if (dy < -3) title.append(" §7| §d").append((int) -dy).append(" down");
+        t.bar.name(legacy(title.toString()));
+
+        p.sendActionBar(legacy("§7Position: §f" + pos + " §7(" + dim + ")"));
         return true;
     }
 
-    private void help(Player p) {
-        p.sendMessage("§6--- WaypointTrail ---");
-        p.sendMessage("§e/wp add <name> [shared] §7- save your current spot");
-        p.sendMessage("§e/wp list §7- your waypoints + shared ones");
-        p.sendMessage("§e/wp track <name> §7- show a particle trail to it");
-        p.sendMessage("§e/wp stop §7- stop the trail");
-        p.sendMessage("§e/wp share|unshare <name> §7- change who can see it");
-        p.sendMessage("§e/wp remove <name> §7- delete one of yours");
+    /** Where the waypoint is relative to where the player is facing. */
+    private String direction(Player p, double dx, double dz) {
+        double targetYaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double rel = targetYaw - p.getLocation().getYaw();
+        rel = ((rel + 180) % 360 + 360) % 360 - 180;
+        double a = Math.abs(rel);
+        String side = rel > 0 ? "right" : "left";
+        if (a < 22.5) return "straight ahead";
+        if (a < 67.5) return "ahead " + side;
+        if (a < 112.5) return side;
+        if (a < 157.5) return "behind " + side;
+        return "behind";
     }
 
-    @Override
-    public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
-        if (!(sender instanceof Player p)) return List.of();
-        if (args.length == 1) {
-            return filter(List.of("add", "list", "track", "stop", "share", "unshare", "remove"), args[0]);
-        }
-        String sub = args[0].toLowerCase();
-        if (args.length == 2) {
-            switch (sub) {
-                case "track", "go", "navigate" -> {
-                    List<String> names = new ArrayList<>();
-                    for (Waypoint w : visibleTo(p)) {
-                        names.add(w.owner.equals(p.getUniqueId()) ? w.name : w.ownerName + ":" + w.name);
-                    }
-                    return filter(names, args[1]);
-                }
-                case "remove", "delete", "share", "unshare" -> {
-                    Map<String, Waypoint> mine = waypoints.getOrDefault(p.getUniqueId(), Map.of());
-                    List<String> names = new ArrayList<>();
-                    for (Waypoint w : mine.values()) names.add(w.name);
-                    return filter(names, args[1]);
-                }
-                default -> {
-                    return List.of();
-                }
+    // ================= commands (Brigadier, so Bedrock gets suggestions) =================
+
+    private int run(CommandContext<CommandSourceStack> ctx, Consumer<Player> action) {
+        if (ctx.getSource().getSender() instanceof Player p) action.accept(p);
+        else ctx.getSource().getSender().sendMessage("Players only.");
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private List<String> trackNames(CommandContext<CommandSourceStack> ctx) {
+        List<String> names = new ArrayList<>();
+        if (ctx.getSource().getSender() instanceof Player p) {
+            for (Waypoint w : visibleTo(p)) {
+                names.add(w.owner.equals(p.getUniqueId()) ? w.name : w.ownerName + ":" + w.name);
             }
         }
-        if (args.length == 3 && sub.equals("add")) return filter(List.of("shared"), args[2]);
-        return List.of();
+        return names;
     }
 
-    private List<String> filter(List<String> options, String prefix) {
-        List<String> out = new ArrayList<>();
-        for (String o : options) if (o.toLowerCase().startsWith(prefix.toLowerCase())) out.add(o);
-        return out;
+    private List<String> ownNames(CommandContext<CommandSourceStack> ctx) {
+        List<String> names = new ArrayList<>();
+        if (ctx.getSource().getSender() instanceof Player p) {
+            for (Waypoint w : visibleTo(p)) if (w.owner.equals(p.getUniqueId())) names.add(w.name);
+        }
+        return names;
+    }
+
+    private CompletableFuture<Suggestions> suggest(SuggestionsBuilder b, Collection<String> names, boolean quoteSpaces) {
+        String rem = b.getRemainingLowerCase();
+        for (String n : names) {
+            String s = (quoteSpaces && n.contains(" ")) ? "\"" + n + "\"" : n;
+            if (s.toLowerCase().startsWith(rem)) b.suggest(s);
+        }
+        return b.buildFuture();
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> buildCommand() {
+        return Commands.literal("wp")
+                .executes(ctx -> run(ctx, this::openMenu))
+                .then(Commands.literal("menu").executes(ctx -> run(ctx, this::openMenu)))
+                .then(Commands.literal("help").executes(ctx -> run(ctx, this::help)))
+                .then(Commands.literal("list").executes(ctx -> run(ctx, this::list)))
+                .then(Commands.literal("stop").executes(ctx -> run(ctx, p -> stopTracking(p, true))))
+                .then(Commands.literal("add")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .executes(ctx -> run(ctx, p -> cmdAdd(p, StringArgumentType.getString(ctx, "name"), false)))
+                                .then(Commands.literal("private")
+                                        .executes(ctx -> run(ctx, p -> cmdAdd(p, StringArgumentType.getString(ctx, "name"), false))))
+                                .then(Commands.literal("shared")
+                                        .executes(ctx -> run(ctx, p -> cmdAdd(p, StringArgumentType.getString(ctx, "name"), true))))))
+                .then(Commands.literal("track")
+                        .then(Commands.argument("name", StringArgumentType.greedyString())
+                                .suggests((ctx, b) -> suggest(b, trackNames(ctx), false))
+                                .executes(ctx -> run(ctx, p -> cmdTrack(p, StringArgumentType.getString(ctx, "name"))))))
+                .then(Commands.literal("share")
+                        .then(Commands.argument("name", StringArgumentType.greedyString())
+                                .suggests((ctx, b) -> suggest(b, ownNames(ctx), false))
+                                .executes(ctx -> run(ctx, p -> cmdShare(p, StringArgumentType.getString(ctx, "name"), true)))))
+                .then(Commands.literal("unshare")
+                        .then(Commands.argument("name", StringArgumentType.greedyString())
+                                .suggests((ctx, b) -> suggest(b, ownNames(ctx), false))
+                                .executes(ctx -> run(ctx, p -> cmdShare(p, StringArgumentType.getString(ctx, "name"), false)))))
+                .then(Commands.literal("rename")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .suggests((ctx, b) -> suggest(b, ownNames(ctx), true))
+                                .then(Commands.argument("newname", StringArgumentType.greedyString())
+                                        .executes(ctx -> run(ctx, p -> cmdRename(p,
+                                                StringArgumentType.getString(ctx, "name"),
+                                                StringArgumentType.getString(ctx, "newname")))))))
+                .then(Commands.literal("remove")
+                        .then(Commands.argument("name", StringArgumentType.greedyString())
+                                .suggests((ctx, b) -> suggest(b, ownNames(ctx), false))
+                                .executes(ctx -> run(ctx, p -> cmdRemove(p, StringArgumentType.getString(ctx, "name"))))));
+    }
+
+    private void cmdAdd(Player p, String name, boolean shared) {
+        String err = createWaypoint(p, name, shared);
+        if (err != null) tell(p, "§c" + err);
+        else tell(p, "§aWaypoint '" + name.trim() + "' created §7(" + (shared ? "shared" : "private") + ")§a.");
+    }
+
+    private void cmdTrack(Player p, String name) {
+        Waypoint w = findVisible(p, name.trim());
+        if (w == null) tell(p, "§cNo waypoint called '" + name + "'. Try /wp list");
+        else startTracking(p, w);
+    }
+
+    private void cmdShare(Player p, String name, boolean shared) {
+        Waypoint w = findVisible(p, name.trim());
+        if (w == null) {
+            tell(p, "§cNo waypoint called '" + name + "'.");
+            return;
+        }
+        String err = setShared(p, w, shared);
+        if (err != null) tell(p, err);
+        else tell(p, "§a'" + w.name + "' is now " + (shared ? "shared with everyone." : "private."));
+    }
+
+    private void cmdRename(Player p, String name, String newName) {
+        Waypoint w = findVisible(p, name.trim());
+        if (w == null) {
+            tell(p, "§cNo waypoint called '" + name + "'.");
+            return;
+        }
+        String err = rename(p, w, newName);
+        if (err != null) tell(p, err.startsWith("§") ? err : "§c" + err);
+        else tell(p, "§aRenamed to '" + w.name + "'.");
+    }
+
+    private void cmdRemove(Player p, String name) {
+        Waypoint w = findVisible(p, name.trim());
+        if (w == null) {
+            tell(p, "§cNo waypoint called '" + name + "'.");
+            return;
+        }
+        String err = remove(p, w);
+        if (err != null) tell(p, err);
+        else tell(p, "§aRemoved '" + w.name + "'.");
+    }
+
+    private void list(Player p) {
+        List<Waypoint> list = visibleTo(p);
+        if (list.isEmpty()) {
+            tell(p, "§7No waypoints yet. Use /wp add <name> or /wp menu");
+            return;
+        }
+        tell(p, "§6--- Waypoints ---");
+        for (Waypoint w : list) {
+            String who = w.owner.equals(p.getUniqueId()) ? "you" : w.ownerName;
+            tell(p, "§e" + w.name + " §7[" + (w.shared ? "shared" : "private") + ", by " + who + "] §f"
+                    + posText(w) + " §7(" + dimName(w.world) + ")");
+        }
+    }
+
+    private void help(Player p) {
+        tell(p, "§6--- WaypointTrail ---");
+        tell(p, "§e/wp §7- open the menu");
+        tell(p, "§e/wp add <name> [shared] §7- save your current spot");
+        tell(p, "§e/wp list §7- your waypoints + shared ones");
+        tell(p, "§e/wp track <name> §7- boss bar to the waypoint");
+        tell(p, "§e/wp stop §7- stop tracking");
+        tell(p, "§e/wp share|unshare <name> §7- owner only");
+        tell(p, "§e/wp rename <name> <new name> §7- owner only");
+        tell(p, "§e/wp remove <name> §7- owner only");
     }
 }
